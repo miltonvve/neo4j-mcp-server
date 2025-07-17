@@ -1,0 +1,68 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: neo4j
+  namespace: neo4j
+  labels:
+    app: neo4j
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: neo4j
+  template:
+    metadata:
+      labels:
+        app: neo4j
+    spec:
+      containers:
+      - name: neo4j
+        image: neo4j:5.15-community
+        ports:
+        - containerPort: 7474
+          name: http
+        - containerPort: 7687
+          name: bolt
+        - containerPort: 7473
+          name: https
+        env:
+        - name: NEO4J_AUTH
+          valueFrom:
+            secretKeyRef:
+              name: neo4j-auth
+              key: NEO4J_AUTH
+        envFrom:
+        - configMapRef:
+            name: neo4j-config
+        volumeMounts:
+        - name: neo4j-data
+          mountPath: /data
+        - name: neo4j-logs
+          mountPath: /logs
+        resources:
+          requests:
+            memory: "2Gi"
+            cpu: "500m"
+          limits:
+            memory: "4Gi"
+            cpu: "2000m"
+        livenessProbe:
+          httpGet:
+            path: /
+            port: 7474
+          initialDelaySeconds: 120
+          periodSeconds: 30
+          timeoutSeconds: 10
+        readinessProbe:
+          httpGet:
+            path: /
+            port: 7474
+          initialDelaySeconds: 60
+          periodSeconds: 10
+          timeoutSeconds: 5
+      volumes:
+      - name: neo4j-data
+        persistentVolumeClaim:
+          claimName: neo4j-data-pvc
+      - name: neo4j-logs
+        emptyDir: {}

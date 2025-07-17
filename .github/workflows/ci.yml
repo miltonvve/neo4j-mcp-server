@@ -1,0 +1,178 @@
+name: CI/CD Pipeline
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main, develop ]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    
+    strategy:
+      matrix:
+        node-version: [18.x, 20.x]
+        neo4j-version: [5.15]
+    
+    services:
+      neo4j:
+        image: neo4j:${{ matrix.neo4j-version }}-community
+        env:
+          NEO4J_AUTH: neo4j/testpassword
+          NEO4J_ACCEPT_LICENSE_AGREEMENT: yes
+        options: >-
+          --health-cmd="cypher-shell -u neo4j -p testpassword 'RETURN 1'"
+          --health-interval=10s
+          --health-timeout=5s
+          --health-retries=5
+        ports:
+          - 7687:7687
+          - 7474:7474
+    
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Use Node.js ${{ matrix.node-version }}
+      uses: actions/setup-node@v4
+      with:
+        node-version: ${{ matrix.node-version }}
+        cache: 'npm'
+    
+    - name: Install dependencies
+      run: npm ci
+    
+    - name: Run linter
+      run: npm run lint
+    
+    - name: Run type checking
+      run: npm run build
+    
+    - name: Run tests
+      run: npm run test:coverage
+      env:
+        NEO4J_URI: bolt://localhost:7687
+        NEO4J_USERNAME: neo4j
+        NEO4J_PASSWORD: testpassword
+        LOG_LEVEL: error
+    
+    - name: Upload coverage to Codecov
+      uses: codecov/codecov-action@v3
+      with:
+        token: ${{ secrets.CODECOV_TOKEN }}
+        file: ./coverage/lcov.info
+        flags: unittests
+        name: codecov-umbrella
+        fail_ci_if_error: true
+
+  security:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Run security audit
+      run: npm audit --audit-level=moderate
+    
+    - name: Run CodeQL Analysis
+      uses: github/codeql-action/init@v2
+      with:
+        languages: javascript
+    
+    - name: Perform CodeQL Analysis
+      uses: github/codeql-action/analyze@v2
+
+  build:
+    needs: [test, security]
+    runs-on: ubuntu-latest
+    
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Use Node.js 20.x
+      uses: actions/setup-node@v4
+      with:
+        node-version: 20.x
+        cache: 'npm'
+    
+    - name: Install dependencies
+      run: npm ci
+    
+    - name: Build application
+      run: npm run build
+    
+    - name: Upload build artifacts
+      uses: actions/upload-artifact@v4
+      with:
+        name: build-files
+        path: dist/
+
+  docker:
+    needs: build
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main'
+    
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@v3
+    
+    - name: Login to Docker Hub
+      uses: docker/login-action@v3
+      with:
+        username: ${{ secrets.DOCKER_USERNAME }}
+        password: ${{ secrets.DOCKER_PASSWORD }}
+    
+    - name: Build and push Docker image
+      uses: docker/build-push-action@v5
+      with:
+        context: .
+        push: true
+        tags: |
+          miltonvve/neo4j-mcp-server:latest
+          miltonvve/neo4j-mcp-server:${{ github.sha }}
+        platforms: linux/amd64,linux/arm64
+        cache-from: type=gha
+        cache-to: type=gha,mode=max
+
+  deploy:
+    needs: [docker]
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main'
+    
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Azure Login
+      uses: azure/login@v1
+      with:
+        creds: ${{ secrets.AZURE_CREDENTIALS }}
+    
+    - name: Deploy to Azure AKS
+      run: |
+        az aks get-credentials --resource-group neo4j-production --name neo4j-aks
+        kubectl apply -f kubernetes/
+        kubectl rollout status deployment/neo4j-mcp-server -n neo4j --timeout=300s
+        
+    - name: Health Check
+      run: |
+        ./scripts/health-check.sh
+        
+    - name: Notify Slack on Success
+      if: success()
+      uses: 8398a7/action-slack@v3
+      with:
+        status: success
+        text: 'Neo4j MCP Server deployed successfully to production! 🚀'
+      env:
+        SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+    
+    - name: Notify Slack on Failure
+      if: failure()
+      uses: 8398a7/action-slack@v3
+      with:
+        status: failure
+        text: 'Neo4j MCP Server deployment failed! 🚨'
+      env:
+        SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
